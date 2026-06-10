@@ -1,0 +1,43 @@
+{
+  "name": "narrativex-agent",
+  "version": "1.0.0",
+  "description": "NarrativeX Desktop Activity Agent",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder --win --x64"
+  },
+  "build": {
+    "appId": "in.narrativexmedia.agent",
+    "productName": "NarrativeX Agent",
+    "npmRebuild": false,
+    "directories": {
+      "output": "release"
+    },
+    "win": {
+      "target": "nsis"
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false
+    },
+    "files": [
+      "src/**/*",
+      "assets/**/*",
+      "renderer/**/*",
+      "node_modules/**/*",
+      "package.json"
+    ]
+  },
+  "keywords": [],
+  "author": "NarrativeX Media",
+  "license": "ISC",
+  "devDependencies": {
+    "electron": "^36.3.1",
+    "electron-builder": "^26.0.12"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.50.0",
+    "uiohook-napi": "^1.5.5"
+  }
+}
