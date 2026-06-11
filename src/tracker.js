@@ -21,16 +21,30 @@ function isWorkingHours() {
   return totalMins >= startMins && totalMins <= endMins;
 }
 
+async function logEvent(event, detail = null) {
+  if (!currentUserId) return;
+  const { error } = await supabase
+    .from('agent_logs')
+    .insert({
+      employee_id: currentUserId,
+      event,
+      detail,
+      ts: new Date().toISOString(),
+    });
+  if (error) console.error('Log insert failed:', error.message);
+}
+
 async function startTracking(session, userId) {
   currentUserId = userId;
 
-  // Set auth session so RLS works when enabled
   if (session?.access_token && session?.refresh_token) {
     await supabase.auth.setSession({
       access_token: session.access_token,
       refresh_token: session.refresh_token,
     });
   }
+
+  await logEvent('started');
 
   const { uIOhook } = require('uiohook-napi');
   uIOhook.on('mousemove', () => { lastActiveTime = Date.now(); });
@@ -41,13 +55,16 @@ async function startTracking(session, userId) {
 
   trackingInterval = setInterval(async () => {
     if (!isWorkingHours()) return;
+
+    await logEvent('heartbeat');
+
     const now = Date.now();
     const inactiveDuration = now - lastActiveTime;
     if (inactiveDuration >= INACTIVE_THRESHOLD) {
       await createFlag(inactiveDuration);
       lastActiveTime = now;
     }
-  }, 60 * 1000);
+  },5 * 60 * 1000);
 }
 
 function stopTracking() {
@@ -64,8 +81,13 @@ async function createFlag(durationMs) {
       duration_minutes: durationMins,
       status: 'pending',
     });
-  if (error) console.error('Flag insert failed:', error);
-  else console.log(`Flag created: ${durationMins} mins inactive`);
+  if (error) {
+    console.error('Flag insert failed:', error);
+    await logEvent('error', `flag_insert_failed: ${error.message}`);
+  } else {
+    console.log(`Flag created: ${durationMins} mins inactive`);
+    await logEvent('flag_inserted', `${durationMins} mins inactive`);
+  }
 }
 
 module.exports = { startTracking, stopTracking };
