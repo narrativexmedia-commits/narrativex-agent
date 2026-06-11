@@ -1,9 +1,9 @@
 const { app, BrowserWindow, ipcMain, session } = require('electron');
 const path = require('path');
 const fs = require('fs');
-const { startTracking } = require('./tracker');
 const { initTray } = require('./tray');
 const { supabase, ANON_KEY, SUPABASE_URL } = require('./supabase');
+const { startTracking, stopTracking } = require('./tracker');
 
 const TOKEN_FILE = path.join(app.getPath('userData'), 'auth.json');
 const WEB_APP_URL = 'https://narrativex-tracker.vercel.app';
@@ -79,7 +79,7 @@ app.whenReady().then(async () => {
       const target = role === 'admin' ? '/admin/dashboard' : '/employee/dashboard';
       openTrackerWindow(target);
       registerIPC();
-      startTracking(sess, userId);
+      if (role !== 'admin') startTracking(sess, userId);
     } else {
       try { fs.unlinkSync(TOKEN_FILE); } catch (_) {}
       openLoginWindow();
@@ -169,7 +169,7 @@ function openLoginWindow() {
           win.close();
           openTrackerWindow(target);
           registerIPC();
-          startTracking(sess, userId);
+          if (role !== 'admin') startTracking(sess, userId);
         }
       } catch (e) {
         console.error('Cookie parse failed:', e);
@@ -192,6 +192,19 @@ function openTrackerWindow(targetPath = null) {
   mainWindow.setMenuBarVisibility(false);
 
   let sessionInjected = false;
+   // Watch for logout
+const checkLogout = setInterval(async () => {
+  const cookies = await session.defaultSession.cookies.get({ url: WEB_APP_URL });
+  const authCookie = cookies.find(c => c.name === 'sb-wowhjuzkglgseqwznxpw-auth-token');
+  if (!authCookie) {
+    clearInterval(checkLogout);
+    stopTracking();
+    userId = null;
+    savedSession = null;
+    try { fs.unlinkSync(TOKEN_FILE); } catch (_) {}
+    console.log('Logged out — tracking stopped, token cleared.');
+  }
+}, 5000);
   mainWindow.webContents.on('did-finish-load', async () => {
     if (savedSession && savedSession.access_token && savedSession.refresh_token && !sessionInjected) {
       sessionInjected = true;
