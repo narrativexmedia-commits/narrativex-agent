@@ -1,12 +1,13 @@
-const { app, BrowserWindow, ipcMain, session, safeStorage } = require('electron');
+const { app, BrowserWindow, ipcMain, session, safeStorage, dialog } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { initTray } = require('./tray');
 const { supabase, ANON_KEY, SUPABASE_URL } = require('./supabase');
 const { startTracking, stopTracking } = require('./tracker');
+const { autoUpdater } = require('electron-updater');
 
 const TOKEN_FILE = path.join(app.getPath('userData'), 'auth.bin');
-const OLD_TOKEN_FILE = path.join(app.getPath('userData'), 'auth.json'); 
+const OLD_TOKEN_FILE = path.join(app.getPath('userData'), 'auth.json');
 const WEB_APP_URL = 'https://narrativex-tracker.vercel.app';
 
 let mainWindow = null;
@@ -27,7 +28,7 @@ async function refreshAndSaveSession(saved) {
   try {
     const sess = extractSession(saved.cookies);
     if (!sess?.access_token || !sess?.refresh_token) {
-      console.error('refreshAndSaveSession: missing tokens in auth.json');
+      console.error('refreshAndSaveSession: missing tokens in auth.bin');
       return null;
     }
 
@@ -69,6 +70,27 @@ async function refreshAndSaveSession(saved) {
 
 app.whenReady().then(async () => {
   setAutoStart(true);
+
+  // autoUpdater setup FIRST
+  autoUpdater.on('update-downloaded', () => {
+    dialog.showMessageBox({
+      type: 'info',
+      title: 'Update Ready',
+      message: 'A new version of NarrativeX Agent has been downloaded. Restart to apply update.',
+      buttons: ['Restart Now', 'Later'],
+    }).then(({ response }) => {
+      if (response === 0) autoUpdater.quitAndInstall();
+    });
+  });
+
+  autoUpdater.on('error', (err) => {
+    console.error('Auto-updater error:', err);
+  });
+
+  // Check for updates (only works in packaged app)
+  if (app.isPackaged) {
+    autoUpdater.checkForUpdatesAndNotify();
+  }
 
   const saved = loadToken();
   if (saved) {
@@ -112,10 +134,8 @@ function extractSession(cookies) {
   }
 }
 
-// REPLACE loadToken
 function loadToken() {
   try {
-    // Migrate: delete old plaintext file if exists
     if (fs.existsSync(OLD_TOKEN_FILE)) {
       fs.unlinkSync(OLD_TOKEN_FILE);
     }
@@ -130,7 +150,6 @@ function loadToken() {
   return null;
 }
 
-// REPLACE saveToken
 function saveToken(data) {
   try {
     const encrypted = safeStorage.encryptString(JSON.stringify(data));
@@ -201,19 +220,21 @@ function openTrackerWindow(targetPath = null) {
   mainWindow.setMenuBarVisibility(false);
 
   let sessionInjected = false;
-   // Watch for logout
-const checkLogout = setInterval(async () => {
-  const cookies = await session.defaultSession.cookies.get({ url: WEB_APP_URL });
-  const authCookie = cookies.find(c => c.name === 'sb-wowhjuzkglgseqwznxpw-auth-token');
-  if (!authCookie) {
-    clearInterval(checkLogout);
-    stopTracking();
-    userId = null;
-    savedSession = null;
-    try { fs.unlinkSync(TOKEN_FILE); } catch (_) {}
-    console.log('Logged out — tracking stopped, token cleared.');
-  }
-}, 5000);
+
+  // Watch for logout
+  const checkLogout = setInterval(async () => {
+    const cookies = await session.defaultSession.cookies.get({ url: WEB_APP_URL });
+    const authCookie = cookies.find(c => c.name === 'sb-wowhjuzkglgseqwznxpw-auth-token');
+    if (!authCookie) {
+      clearInterval(checkLogout);
+      stopTracking();
+      userId = null;
+      savedSession = null;
+      try { fs.unlinkSync(TOKEN_FILE); } catch (_) {}
+      console.log('Logged out — tracking stopped, token cleared.');
+    }
+  }, 5000);
+
   mainWindow.webContents.on('did-finish-load', async () => {
     if (savedSession && savedSession.access_token && savedSession.refresh_token && !sessionInjected) {
       sessionInjected = true;
@@ -245,11 +266,12 @@ const checkLogout = setInterval(async () => {
   });
 
   mainWindow.on('close', (e) => {
-  if (!app.isQuitting) {
-    e.preventDefault();
-    mainWindow.hide();
-  }
-});
+    if (!app.isQuitting) {
+      e.preventDefault();
+      mainWindow.hide();
+    }
+  });
+
   const loadURL = targetPath ? `${WEB_APP_URL}${targetPath}` : WEB_APP_URL;
   mainWindow.loadURL(loadURL);
 
