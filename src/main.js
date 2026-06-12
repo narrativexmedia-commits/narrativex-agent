@@ -1,11 +1,12 @@
-const { app, BrowserWindow, ipcMain, session } = require('electron');
+const { app, BrowserWindow, ipcMain, session, safeStorage } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { initTray } = require('./tray');
 const { supabase, ANON_KEY, SUPABASE_URL } = require('./supabase');
 const { startTracking, stopTracking } = require('./tracker');
 
-const TOKEN_FILE = path.join(app.getPath('userData'), 'auth.json');
+const TOKEN_FILE = path.join(app.getPath('userData'), 'auth.bin');
+const OLD_TOKEN_FILE = path.join(app.getPath('userData'), 'auth.json'); 
 const WEB_APP_URL = 'https://narrativex-tracker.vercel.app';
 
 let mainWindow = null;
@@ -111,11 +112,17 @@ function extractSession(cookies) {
   }
 }
 
+// REPLACE loadToken
 function loadToken() {
   try {
+    // Migrate: delete old plaintext file if exists
+    if (fs.existsSync(OLD_TOKEN_FILE)) {
+      fs.unlinkSync(OLD_TOKEN_FILE);
+    }
     if (fs.existsSync(TOKEN_FILE)) {
-      const raw = fs.readFileSync(TOKEN_FILE, 'utf-8');
-      return JSON.parse(raw);
+      const encrypted = fs.readFileSync(TOKEN_FILE);
+      const decrypted = safeStorage.decryptString(encrypted);
+      return JSON.parse(decrypted);
     }
   } catch (e) {
     console.error('Token load failed:', e);
@@ -123,9 +130,11 @@ function loadToken() {
   return null;
 }
 
+// REPLACE saveToken
 function saveToken(data) {
   try {
-    fs.writeFileSync(TOKEN_FILE, JSON.stringify(data), 'utf-8');
+    const encrypted = safeStorage.encryptString(JSON.stringify(data));
+    fs.writeFileSync(TOKEN_FILE, encrypted);
   } catch (e) {
     console.error('Token save failed:', e);
   }
