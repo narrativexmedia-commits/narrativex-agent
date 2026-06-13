@@ -8,32 +8,32 @@
     "build": "electron-builder --win --x64"
   },
   "build": {
-  "appId": "in.narrativexmedia.agent",
-  "productName": "NarrativeX Agent",
-  "npmRebuild": false,
-  "publish": {
-    "provider": "github",
-    "owner": "narrativexmedia-commits",
-    "repo": "narrativex-agent"
+    "appId": "in.narrativexmedia.agent",
+    "productName": "NarrativeX Agent",
+    "npmRebuild": false,
+    "publish": {
+      "provider": "github",
+      "owner": "narrativexmedia-commits",
+      "repo": "narrativex-agent"
+    },
+    "directories": {
+      "output": "release"
+    },
+    "win": {
+      "target": "nsis"
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false
+    },
+    "files": [
+      "src/**/*",
+      "assets/**/*",
+      "renderer/**/*",
+      "node_modules/**/*",
+      "package.json"
+    ]
   },
-  "directories": {
-    "output": "release"
-  },
-  "win": {
-    "target": "nsis"
-  },
-  "nsis": {
-    "oneClick": true,
-    "perMachine": false
-  },
-  "files": [
-    "src/**/*",
-    "assets/**/*",
-    "renderer/**/*",
-    "node_modules/**/*",
-    "package.json"
-  ]
-},
   "keywords": [],
   "author": "NarrativeX Media",
   "license": "ISC",
@@ -42,6 +42,7 @@
     "electron-builder": "^26.0.12"
   },
   "dependencies": {
+    "@sentry/electron": "^7.13.0",
     "@supabase/supabase-js": "^2.50.0",
     "electron-updater": "^6.8.9",
     "uiohook-napi": "^1.5.5"

@@ -5,6 +5,12 @@ const { initTray } = require('./tray');
 const { supabase, ANON_KEY, SUPABASE_URL } = require('./supabase');
 const { startTracking, stopTracking } = require('./tracker');
 const { autoUpdater } = require('electron-updater');
+const { init: sentryInit } = require('@sentry/electron/main');
+
+sentryInit({
+  dsn: "https://83c3738c5970e3801c817e1f6b6a0b39@o4511556897996800.ingest.us.sentry.io/4511556911628288",
+  environment: app.isPackaged ? "production" : "development",
+});
 
 const TOKEN_FILE = path.join(app.getPath('userData'), 'auth.bin');
 const OLD_TOKEN_FILE = path.join(app.getPath('userData'), 'auth.json');
@@ -13,6 +19,7 @@ const WEB_APP_URL = 'https://narrativex-tracker.vercel.app';
 let mainWindow = null;
 let userId = null;
 let savedSession = null;
+let heartbeatTimer = null;
 
 function setAutoStart(enable = true) {
   if (!app.isPackaged) return;
@@ -23,6 +30,33 @@ function setAutoStart(enable = true) {
     path: process.execPath,
   });
 }
+
+// ─── HEARTBEAT ───────────────────────────────────────────────────────────────
+async function sendHeartbeat() {
+  if (!userId) return;
+  try {
+    const { error } = await supabase
+      .from('agent_heartbeats')
+      .insert({ employee_id: userId });
+    if (error) console.error('[heartbeat] insert error:', error.message);
+  } catch (err) {
+    console.error('[heartbeat] unexpected error:', err.message);
+  }
+}
+
+function startHeartbeat() {
+  if (heartbeatTimer) return; // already running
+  sendHeartbeat(); // immediate ping on login
+  heartbeatTimer = setInterval(sendHeartbeat, 5 * 60 * 1000); // every 5 min
+}
+
+function stopHeartbeat() {
+  if (heartbeatTimer) {
+    clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
+  }
+}
+// ─────────────────────────────────────────────────────────────────────────────
 
 async function refreshAndSaveSession(saved) {
   try {
@@ -71,7 +105,6 @@ async function refreshAndSaveSession(saved) {
 app.whenReady().then(async () => {
   setAutoStart(true);
 
-  // autoUpdater setup FIRST
   autoUpdater.on('update-downloaded', () => {
     dialog.showMessageBox({
       type: 'info',
@@ -87,7 +120,6 @@ app.whenReady().then(async () => {
     console.error('Auto-updater error:', err);
   });
 
-  // Check for updates (only works in packaged app)
   if (app.isPackaged) {
     autoUpdater.checkForUpdatesAndNotify();
   }
@@ -102,7 +134,10 @@ app.whenReady().then(async () => {
       const target = role === 'admin' ? '/admin/dashboard' : '/employee/dashboard';
       openTrackerWindow(target);
       registerIPC();
-      if (role !== 'admin') startTracking(sess, userId);
+      if (role !== 'admin') {
+        startTracking(sess, userId);
+        startHeartbeat(); // ← start heartbeat for employees
+      }
     } else {
       try { fs.unlinkSync(TOKEN_FILE); } catch (_) {}
       openLoginWindow();
@@ -114,6 +149,11 @@ app.whenReady().then(async () => {
 
 app.on('window-all-closed', (e) => {
   e.preventDefault();
+});
+
+app.on('before-quit', () => {
+  app.isQuitting = true;
+  stopHeartbeat(); // ← clean up on quit
 });
 
 function extractSession(cookies) {
@@ -197,7 +237,10 @@ function openLoginWindow() {
           win.close();
           openTrackerWindow(target);
           registerIPC();
-          if (role !== 'admin') startTracking(sess, userId);
+          if (role !== 'admin') {
+            startTracking(sess, userId);
+            startHeartbeat(); // ← start heartbeat for employees
+          }
         }
       } catch (e) {
         console.error('Cookie parse failed:', e);
@@ -221,13 +264,13 @@ function openTrackerWindow(targetPath = null) {
 
   let sessionInjected = false;
 
-  // Watch for logout
   const checkLogout = setInterval(async () => {
     const cookies = await session.defaultSession.cookies.get({ url: WEB_APP_URL });
     const authCookie = cookies.find(c => c.name === 'sb-wowhjuzkglgseqwznxpw-auth-token');
     if (!authCookie) {
       clearInterval(checkLogout);
       stopTracking();
+      stopHeartbeat(); // ← stop heartbeat on logout
       userId = null;
       savedSession = null;
       try { fs.unlinkSync(TOKEN_FILE); } catch (_) {}
