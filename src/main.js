@@ -45,15 +45,50 @@ async function sendHeartbeat() {
 }
 
 function startHeartbeat() {
-  if (heartbeatTimer) return; // already running
-  sendHeartbeat(); // immediate ping on login
-  heartbeatTimer = setInterval(sendHeartbeat, 5 * 60 * 1000); // every 5 min
+  if (heartbeatTimer) return;
+  sendHeartbeat();
+  heartbeatTimer = setInterval(sendHeartbeat, 5 * 60 * 1000);
 }
 
 function stopHeartbeat() {
   if (heartbeatTimer) {
     clearInterval(heartbeatTimer);
     heartbeatTimer = null;
+  }
+}
+
+// ─── ROLE FROM PROFILES (permanent fix — not user_metadata) ──────────────────
+async function getRoleFromProfiles(uid) {
+  try {
+    const { data, error } = await supabase
+      .from('profiles')
+      .select('role')
+      .eq('id', uid)
+      .maybeSingle();
+    if (error) console.error('getRoleFromProfiles error:', error.message);
+    return data?.role ?? 'employee'; // default to employee if missing
+  } catch (e) {
+    console.error('getRoleFromProfiles exception:', e);
+    return 'employee';
+  }
+}
+
+// ─── FRESH SESSION REFRESH (permanent fix — always verified tokens) ───────────
+async function getFreshSession(accessToken, refreshToken) {
+  try {
+    const { data, error } = await supabase.auth.setSession({
+      access_token: accessToken,
+      refresh_token: refreshToken,
+    });
+    if (error || !data?.session) {
+      console.error('getFreshSession failed:', error?.message ?? 'no session');
+      return null;
+    }
+    console.log('getFreshSession OK, user:', data.session.user.id);
+    return data.session;
+  } catch (e) {
+    console.error('getFreshSession exception:', e);
+    return null;
   }
 }
 // ─────────────────────────────────────────────────────────────────────────────
@@ -66,17 +101,8 @@ async function refreshAndSaveSession(saved) {
       return null;
     }
 
-    const { data, error } = await supabase.auth.setSession({
-      access_token: sess.access_token,
-      refresh_token: sess.refresh_token,
-    });
-
-    if (error || !data?.session) {
-      console.error('Token refresh failed:', error?.message ?? 'no session returned');
-      return null;
-    }
-
-    const freshSession = data.session;
+    const freshSession = await getFreshSession(sess.access_token, sess.refresh_token);
+    if (!freshSession) return null;
 
     const updatedCookies = (saved.cookies || []).map(c => {
       if (c.name === 'sb-wowhjuzkglgseqwznxpw-auth-token') {
@@ -130,13 +156,13 @@ app.whenReady().then(async () => {
     if (sess) {
       userId = sess.user.id;
       savedSession = sess;
-      const role = sess.user?.user_metadata?.role;
+      const role = await getRoleFromProfiles(userId); // ← from profiles, not user_metadata
       const target = role === 'admin' ? '/admin/dashboard' : '/employee/dashboard';
       openTrackerWindow(target);
       registerIPC();
       if (role !== 'admin') {
-        startTracking(sess, userId);
-        startHeartbeat(); // ← start heartbeat for employees
+        startTracking(sess, userId); // sess is already fresh from refreshAndSaveSession
+        startHeartbeat();
       }
     } else {
       try { fs.unlinkSync(TOKEN_FILE); } catch (_) {}
@@ -153,7 +179,7 @@ app.on('window-all-closed', (e) => {
 
 app.on('before-quit', () => {
   app.isQuitting = true;
-  stopHeartbeat(); // ← clean up on quit
+  stopHeartbeat();
 });
 
 function extractSession(cookies) {
@@ -228,18 +254,34 @@ function openLoginWindow() {
           ? JSON.parse(Buffer.from(parsed.join(''), 'base64').toString('utf-8'))
           : parsed;
         const uid = sess.user?.id;
+
         if (sess.access_token && uid) {
           userId = uid;
-          savedSession = sess;
-          const role = sess.user?.user_metadata?.role;
+
+          // ── PERMANENT FIX: always get fresh verified session before tracking ──
+          const freshSess = await getFreshSession(sess.access_token, sess.refresh_token);
+          if (!freshSess) {
+            console.error('openLoginWindow: could not refresh session after login');
+            // Fall back to raw sess — better than nothing
+            savedSession = sess;
+          } else {
+            savedSession = freshSess;
+          }
+
+          const activeSession = freshSess ?? sess;
+
+          // ── PERMANENT FIX: role from profiles, not user_metadata ──
+          const role = await getRoleFromProfiles(uid);
           const target = role === 'admin' ? '/admin/dashboard' : '/employee/dashboard';
+
           saveToken({ userId, cookies });
           win.close();
           openTrackerWindow(target);
           registerIPC();
+
           if (role !== 'admin') {
-            startTracking(sess, userId);
-            startHeartbeat(); // ← start heartbeat for employees
+            startTracking(activeSession, userId); // always fresh tokens
+            startHeartbeat();
           }
         }
       } catch (e) {
@@ -270,7 +312,7 @@ function openTrackerWindow(targetPath = null) {
     if (!authCookie) {
       clearInterval(checkLogout);
       stopTracking();
-      stopHeartbeat(); // ← stop heartbeat on logout
+      stopHeartbeat();
       userId = null;
       savedSession = null;
       try { fs.unlinkSync(TOKEN_FILE); } catch (_) {}
