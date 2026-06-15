@@ -4,15 +4,15 @@ const { supabase } = require('./supabase');
 const INACTIVE_THRESHOLD = 5 * 60 * 1000;  // 5 min to be considered idle
 const CHECK_INTERVAL     = 1 * 60 * 1000;  // check every 1 min
 const WORK_START = { hour: 9,  minute: 30 };
-const WORK_END   = { hour: 18, minute: 30 };
+const WORK_END   = { hour: 18, minute: 0 };
 
 let trackingInterval = null;
-let lastActiveTime   = null;   // last mouse/key event
-let idleStartTime    = null;   // when current idle period began (null = not idle)
-let flagging         = false;  // guard against double-flag on rapid events
+let lastActiveTime   = null;
+let idleStartTime    = null;
+let flagging         = false;
 let currentUserId    = null;
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function getISTTime() {
   return new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
@@ -33,6 +33,19 @@ function isPastWorkEnd() {
   return totalMins > endMins;
 }
 
+// FIX 1: Returns work-end timestamp (ms) for the IST day that idleStartTs belongs to
+function getWorkEndForDay(timestampMs) {
+  const dateStr = new Date(timestampMs).toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+  const hh = String(WORK_END.hour).padStart(2, '0');
+  const mm = String(WORK_END.minute).padStart(2, '0');
+  return new Date(`${dateStr}T${hh}:${mm}:00+05:30`).getTime();
+}
+
+// FIX 2 & 4: Returns IST date string (YYYY-MM-DD) for any timestamp
+function getISTDateStr(timestampMs) {
+  return new Date(timestampMs).toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+}
+
 async function logEvent(event, detail = null) {
   if (!currentUserId) return;
   const { error } = await supabase
@@ -44,15 +57,27 @@ async function logEvent(event, detail = null) {
 // ─── Flag Creation ────────────────────────────────────────────────────────────
 
 async function createFlag(idleStartTs, idleEndTs) {
-  const durationMs   = idleEndTs - idleStartTs;
+  // FIX 1: Cap idleEndTs at work-end of the SAME IST day as idleStartTs
+  // Prevents overnight / post-work-hours inflation
+  const workEndTs  = getWorkEndForDay(idleStartTs);
+  const cappedEnd  = Math.min(idleEndTs, workEndTs);
+
+  const durationMs   = cappedEnd - idleStartTs;
   const durationMins = Math.round(durationMs / 60000);
+
+  // Skip if capping made duration trivial
+  if (durationMins < 1) {
+    console.log('Flag skipped: capped duration < 1 min');
+    await logEvent('flag_skipped', 'capped duration < 1 min');
+    return;
+  }
 
   const { error } = await supabase
     .from('activity_flags')
     .insert({
       employee_id:      currentUserId,
-      idle_start:       new Date(idleStartTs).toISOString(),  // idle began
-      flagged_at:       new Date(idleEndTs).toISOString(),    // idle ended
+      idle_start:       new Date(idleStartTs).toISOString(),
+      flagged_at:       new Date(cappedEnd).toISOString(),  // capped end, not raw now
       duration_minutes: durationMins,
       status:           'pending',
     });
@@ -66,21 +91,30 @@ async function createFlag(idleStartTs, idleEndTs) {
   }
 }
 
-// ─── Activity Handler (called on every mouse/key event) ───────────────────────
+// ─── Activity Handler ─────────────────────────────────────────────────────────
 
 async function handleActivity() {
   const now = Date.now();
 
-  // Transitioning from idle → active
   if (idleStartTime !== null && !flagging) {
-    const capturedStart = idleStartTime;
-    idleStartTime = null;  // clear immediately — prevents re-entry from rapid events
+    // FIX 2: Discard idleStartTime if it's from a DIFFERENT IST day (PC was asleep overnight)
+    const idleDay = getISTDateStr(idleStartTime);
+    const today   = getISTDateStr(now);
 
-    const duration = now - capturedStart;
-    if (duration >= INACTIVE_THRESHOLD) {
-      flagging = true;
-      await createFlag(capturedStart, now);
-      flagging = false;
+    if (idleDay !== today) {
+      console.log(`Stale idleStartTime from ${idleDay} discarded (today is ${today})`);
+      await logEvent('idle_discarded', `stale idle from ${idleDay}`);
+      idleStartTime = null;
+    } else {
+      const capturedStart = idleStartTime;
+      idleStartTime = null;
+
+      const duration = now - capturedStart;
+      if (duration >= INACTIVE_THRESHOLD) {
+        flagging = true;
+        await createFlag(capturedStart, now);
+        flagging = false;
+      }
     }
   }
 
@@ -91,7 +125,7 @@ async function handleActivity() {
 
 async function startTracking(session, userId) {
   currentUserId  = userId;
-  lastActiveTime = Date.now();  // reset to NOW (not module load time)
+  lastActiveTime = Date.now();
   idleStartTime  = null;
   flagging       = false;
 
@@ -104,6 +138,15 @@ async function startTracking(session, userId) {
 
   await logEvent('started');
 
+  // FIX 3: Reset all state when PC wakes from sleep
+  // Without this: lastActiveTime is stale → interval thinks overnight = one big idle
+  powerMonitor.on('resume', async () => {
+    console.log('PC resumed from sleep — resetting tracking state');
+    lastActiveTime = Date.now();
+    idleStartTime  = null;
+    await logEvent('resume', 'PC woke from sleep, tracking state reset');
+  });
+
   const { uIOhook } = require('uiohook-napi');
   uIOhook.on('mousemove', handleActivity);
   uIOhook.on('keydown',   handleActivity);
@@ -115,12 +158,11 @@ async function startTracking(session, userId) {
     const now              = Date.now();
     const inactiveDuration = now - lastActiveTime;
 
-    // Log heartbeat with current idle state
     await logEvent('heartbeat',
       `inactive: ${Math.floor(inactiveDuration / 1000)}s | idling: ${idleStartTime !== null}`
     );
 
-    // Past work end — close any open idle period and stop
+    // Past work end — close any open idle and return
     if (isPastWorkEnd()) {
       if (idleStartTime !== null && !flagging) {
         const capturedStart = idleStartTime;
@@ -128,18 +170,29 @@ async function startTracking(session, userId) {
         const duration = now - capturedStart;
         if (duration >= INACTIVE_THRESHOLD) {
           flagging = true;
-          await createFlag(capturedStart, now);
+          await createFlag(capturedStart, now); // createFlag caps at work-end anyway
           flagging = false;
         }
       }
       return;
     }
 
-    // Within working hours — detect idle start
+    // Before work start — skip
     if (!isWorkingHours()) return;
 
+    // Detect idle start
     if (inactiveDuration >= INACTIVE_THRESHOLD && idleStartTime === null) {
-      // Idle period just crossed threshold — record when it began
+      // FIX 4: lastActiveTime is from a previous day (PC left on, no logout, no sleep)
+      // Don't flag overnight gap — just reset lastActiveTime to now and start fresh
+      const lastActiveDay = getISTDateStr(lastActiveTime);
+      const today         = getISTDateStr(now);
+      if (lastActiveDay !== today) {
+        console.log(`lastActiveTime from ${lastActiveDay} — resetting to now, no flag`);
+        await logEvent('last_active_reset', `stale lastActiveTime from ${lastActiveDay}`);
+        lastActiveTime = now;
+        return;
+      }
+
       idleStartTime = lastActiveTime;
       console.log(`Idle period started at ${new Date(idleStartTime).toISOString()}`);
     }
