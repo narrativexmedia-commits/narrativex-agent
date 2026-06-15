@@ -12,14 +12,15 @@ sentryInit({
   environment: app.isPackaged ? "production" : "development",
 });
 
-const TOKEN_FILE = path.join(app.getPath('userData'), 'auth.bin');
+const TOKEN_FILE     = path.join(app.getPath('userData'), 'auth.bin');
 const OLD_TOKEN_FILE = path.join(app.getPath('userData'), 'auth.json');
-const WEB_APP_URL = 'https://narrativex-tracker.vercel.app';
+const WEB_APP_URL    = 'https://narrativex-tracker.vercel.app';
 
-let mainWindow = null;
-let userId = null;
-let savedSession = null;
+let mainWindow     = null;
+let userId         = null;
+let savedSession   = null;
 let heartbeatTimer = null;
+let ipcRegistered  = false; // FIX 2: guard against duplicate IPC handler registration
 
 function setAutoStart(enable = true) {
   if (!app.isPackaged) return;
@@ -31,7 +32,7 @@ function setAutoStart(enable = true) {
   });
 }
 
-// ─── HEARTBEAT ───────────────────────────────────────────────────────────────
+// ─── HEARTBEAT ────────────────────────────────────────────────────────────────
 async function sendHeartbeat() {
   if (!userId) return;
   try {
@@ -57,7 +58,7 @@ function stopHeartbeat() {
   }
 }
 
-// ─── ROLE FROM PROFILES (permanent fix — not user_metadata) ──────────────────
+// ─── ROLE FROM PROFILES ───────────────────────────────────────────────────────
 async function getRoleFromProfiles(uid) {
   try {
     const { data, error } = await supabase
@@ -66,18 +67,18 @@ async function getRoleFromProfiles(uid) {
       .eq('id', uid)
       .maybeSingle();
     if (error) console.error('getRoleFromProfiles error:', error.message);
-    return data?.role ?? 'employee'; // default to employee if missing
+    return data?.role ?? 'employee';
   } catch (e) {
     console.error('getRoleFromProfiles exception:', e);
     return 'employee';
   }
 }
 
-// ─── FRESH SESSION REFRESH (permanent fix — always verified tokens) ───────────
+// ─── FRESH SESSION ────────────────────────────────────────────────────────────
 async function getFreshSession(accessToken, refreshToken) {
   try {
     const { data, error } = await supabase.auth.setSession({
-      access_token: accessToken,
+      access_token:  accessToken,
       refresh_token: refreshToken,
     });
     if (error || !data?.session) {
@@ -91,7 +92,6 @@ async function getFreshSession(accessToken, refreshToken) {
     return null;
   }
 }
-// ─────────────────────────────────────────────────────────────────────────────
 
 async function refreshAndSaveSession(saved) {
   try {
@@ -109,10 +109,10 @@ async function refreshAndSaveSession(saved) {
         return {
           ...c,
           value: encodeURIComponent(JSON.stringify({
-            access_token: freshSession.access_token,
+            access_token:  freshSession.access_token,
             refresh_token: freshSession.refresh_token,
-            user: freshSession.user,
-            expires_at: freshSession.expires_at,
+            user:          freshSession.user,
+            expires_at:    freshSession.expires_at,
           })),
         };
       }
@@ -128,6 +128,36 @@ async function refreshAndSaveSession(saved) {
   }
 }
 
+// ─── LOGOUT CLEANUP ───────────────────────────────────────────────────────────
+// FIX 1 + FIX 3: Full cleanup on logout — stop everything, clear session, reopen login
+async function handleLogout() {
+  stopTracking();
+  stopHeartbeat();
+  await supabase.auth.signOut(); // ← add this
+  userId       = null;
+  savedSession = null;
+  try { fs.unlinkSync(TOKEN_FILE); } catch (_) {}
+  console.log('Logged out — tracking stopped, token cleared.');
+
+  // FIX 3: Clear Electron session storage so next login starts completely fresh
+  // Prevents stale Supabase localStorage from ghost-restoring old session
+  try {
+    await session.defaultSession.clearStorageData({ storages: ['localstorage', 'cookies', 'sessionstorage'] });
+    console.log('Session storage cleared.');
+  } catch (e) {
+    console.error('clearStorageData error:', e);
+  }
+
+  // FIX 1: Destroy tracker window and reopen login window
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.destroy();
+    mainWindow = null;
+  }
+
+  openLoginWindow();
+}
+
+// ─── APP READY ────────────────────────────────────────────────────────────────
 app.whenReady().then(async () => {
   setAutoStart(true);
 
@@ -154,14 +184,14 @@ app.whenReady().then(async () => {
   if (saved) {
     const sess = await refreshAndSaveSession(saved);
     if (sess) {
-      userId = sess.user.id;
+      userId       = sess.user.id;
       savedSession = sess;
-      const role = await getRoleFromProfiles(userId); // ← from profiles, not user_metadata
+      const role   = await getRoleFromProfiles(userId);
       const target = role === 'admin' ? '/admin/dashboard' : '/employee/dashboard';
       openTrackerWindow(target);
       registerIPC();
       if (role !== 'admin') {
-        startTracking(sess, userId); // sess is already fresh from refreshAndSaveSession
+        startTracking(sess, userId);
         startHeartbeat();
       }
     } else {
@@ -182,6 +212,7 @@ app.on('before-quit', () => {
   stopHeartbeat();
 });
 
+// ─── HELPERS ──────────────────────────────────────────────────────────────────
 function extractSession(cookies) {
   try {
     const authCookie = cookies.find(c => c.name === 'sb-wowhjuzkglgseqwznxpw-auth-token');
@@ -225,6 +256,7 @@ function saveToken(data) {
   }
 }
 
+// ─── LOGIN WINDOW ─────────────────────────────────────────────────────────────
 function openLoginWindow() {
   const win = new BrowserWindow({
     width: 480,
@@ -240,7 +272,7 @@ function openLoginWindow() {
   win.setMenuBarVisibility(false);
 
   const checkLogin = setInterval(async () => {
-    const cookies = await session.defaultSession.cookies.get({ url: WEB_APP_URL });
+    const cookies    = await session.defaultSession.cookies.get({ url: WEB_APP_URL });
     const authCookie = cookies.find(c => c.name === 'sb-wowhjuzkglgseqwznxpw-auth-token');
     if (authCookie) {
       clearInterval(checkLogin);
@@ -250,7 +282,7 @@ function openLoginWindow() {
           raw = Buffer.from(raw.slice(7), 'base64').toString('utf-8');
         }
         const parsed = JSON.parse(raw);
-        const sess = Array.isArray(parsed)
+        const sess   = Array.isArray(parsed)
           ? JSON.parse(Buffer.from(parsed.join(''), 'base64').toString('utf-8'))
           : parsed;
         const uid = sess.user?.id;
@@ -258,29 +290,25 @@ function openLoginWindow() {
         if (sess.access_token && uid) {
           userId = uid;
 
-          // ── PERMANENT FIX: always get fresh verified session before tracking ──
           const freshSess = await getFreshSession(sess.access_token, sess.refresh_token);
           if (!freshSess) {
             console.error('openLoginWindow: could not refresh session after login');
-            // Fall back to raw sess — better than nothing
             savedSession = sess;
           } else {
             savedSession = freshSess;
           }
 
           const activeSession = freshSess ?? sess;
-
-          // ── PERMANENT FIX: role from profiles, not user_metadata ──
-          const role = await getRoleFromProfiles(uid);
-          const target = role === 'admin' ? '/admin/dashboard' : '/employee/dashboard';
+          const role          = await getRoleFromProfiles(uid);
+          const target        = role === 'admin' ? '/admin/dashboard' : '/employee/dashboard';
 
           saveToken({ userId, cookies });
           win.close();
           openTrackerWindow(target);
-          registerIPC();
+          registerIPC(); // FIX 2: guard inside registerIPC ensures no duplicate handlers
 
           if (role !== 'admin') {
-            startTracking(activeSession, userId); // always fresh tokens
+            startTracking(activeSession, userId);
             startHeartbeat();
           }
         }
@@ -291,6 +319,7 @@ function openLoginWindow() {
   }, 2000);
 }
 
+// ─── TRACKER WINDOW ───────────────────────────────────────────────────────────
 function openTrackerWindow(targetPath = null) {
   mainWindow = new BrowserWindow({
     width: 1200,
@@ -306,27 +335,23 @@ function openTrackerWindow(targetPath = null) {
 
   let sessionInjected = false;
 
+  // FIX 1: Use handleLogout() — cleans up + reopens login window
   const checkLogout = setInterval(async () => {
-    const cookies = await session.defaultSession.cookies.get({ url: WEB_APP_URL });
+    const cookies    = await session.defaultSession.cookies.get({ url: WEB_APP_URL });
     const authCookie = cookies.find(c => c.name === 'sb-wowhjuzkglgseqwznxpw-auth-token');
     if (!authCookie) {
       clearInterval(checkLogout);
-      stopTracking();
-      stopHeartbeat();
-      userId = null;
-      savedSession = null;
-      try { fs.unlinkSync(TOKEN_FILE); } catch (_) {}
-      console.log('Logged out — tracking stopped, token cleared.');
+      await handleLogout();
     }
   }, 5000);
 
   mainWindow.webContents.on('did-finish-load', async () => {
     if (savedSession && savedSession.access_token && savedSession.refresh_token && !sessionInjected) {
       sessionInjected = true;
-      const accessToken = savedSession.access_token;
+      const accessToken  = savedSession.access_token;
       const refreshToken = savedSession.refresh_token;
-      const url = SUPABASE_URL;
-      const key = ANON_KEY;
+      const url          = SUPABASE_URL;
+      const key          = ANON_KEY;
       await mainWindow.webContents.executeJavaScript(`
         (async function() {
           try {
@@ -363,7 +388,12 @@ function openTrackerWindow(targetPath = null) {
   initTray(mainWindow);
 }
 
+// ─── IPC ──────────────────────────────────────────────────────────────────────
+// FIX 2: Register only once — handlers use module-level `userId` which updates on re-login
 function registerIPC() {
+  if (ipcRegistered) return;
+  ipcRegistered = true;
+
   ipcMain.handle('get-flags', async () => {
     const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
     const { data, error } = await supabase
