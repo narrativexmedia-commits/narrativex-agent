@@ -1,6 +1,6 @@
 {
   "name": "narrativex-agent",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "NarrativeX Desktop Activity Agent",
   "main": "src/main.js",
   "scripts": {
